@@ -2,115 +2,144 @@ import os
 import cv2
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import models
-import random
+from tensorflow.keras import layers, models
+import json
 
 
 class CableDefectDetection:
-    def __init__(self, results_dir, **kwargs):
+    """
+    Cable Defect Detection using Autoencoder and Pseudo Defect Generation
+    
+    This model performs two-stage detection:
+    1. Extract individual cables from sensor images
+    2. Classify each cable as defective or non-defective
+    
+    Detection methods:
+    - Cut detection: Detects diagonal/vertical cuts using Hough Line Transform
+    - Autoencoder: Detects large spots, burns, and other anomalies
+    """
+    
+    def __init__(self, results_dir, model_path=None, **kwargs):
         """
-        Initialize the Cable Defect Detection model.
+        Initialize the cable defect detection model.
         
         Args:
-            results_dir: Directory where output files will be saved
-            **kwargs: Additional configuration parameters
-                - model_path: Path to the trained autoencoder model (.keras file)
-                - threshold: Detection threshold (default: 0.0035)
-                - patch_size: Patch size for autoencoder (default: 64)
-                - stride: Stride for patch extraction (default: 32)
-                - min_cut_angle: Minimum angle for cut detection in degrees (default: 30)
-                - min_sensor_width_ratio: Minimum width ratio for cable detection (default: 0.3)
+            results_dir: Directory to save results and visualizations
+            model_path: Path to the trained autoencoder weights (.keras file)
+            **kwargs: Additional configuration options
         """
         self.results_dir = results_dir
-        os.makedirs(self.results_dir, exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
         
-        # Model parameters
-        self.threshold = kwargs.get('threshold', 0.0035)
+        # Configuration
         self.patch_size = kwargs.get('patch_size', 64)
         self.stride = kwargs.get('stride', 32)
         self.min_cut_angle = kwargs.get('min_cut_angle', 30)
+        self.threshold = kwargs.get('threshold', 0.0035)
         self.min_sensor_width_ratio = kwargs.get('min_sensor_width_ratio', 0.3)
         
-        # Load the autoencoder model
-        model_path = kwargs.get('model_path', 'sensor_autoencoder.keras')
-        if os.path.exists(model_path):
-            self.model = models.load_model(model_path)
-            print(f"Loaded model from {model_path}")
-        else:
-            print(f"Warning: Model file {model_path} not found. Model will be unavailable.")
-            self.model = None
+        # Load autoencoder model
+        if model_path is None:
+            model_path = kwargs.get('autoencoder_path', 'sensor_autoencoder.keras')
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model weights not found at {model_path}")
+        
+        self.model = tf.keras.models.load_model(model_path)
+        print(f"✓ Loaded autoencoder model from {model_path}")
     
-    def _extract_sensors_from_image(self, img):
-        """Extract individual cables from an image using contour detection."""
+    # ====================================
+    # CABLE EXTRACTION
+    # ====================================
+    
+    def extract_cables_from_image(self, image_path):
+        """
+        Extract individual cables from sensor image using contour detection.
+        
+        Returns:
+            cables: List of cable images (numpy arrays)
+            cable_info: List of metadata dictionaries for each cable
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            return [], []
+        
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape
-
+        
         # Binary threshold
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
+        
         # Morphological closing
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-
+        
         # Find contours
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Filter and extract sensors
-        sensors = []
-        sensor_info = []
-
+        
+        # Filter and extract cables
+        cables = []
+        cable_info = []
+        
         for idx, contour in enumerate(contours):
             area = cv2.contourArea(contour)
             x, y, w, h = cv2.boundingRect(contour)
-
+            
             # Filter: must be large enough and relatively horizontal
             if area > 1000 and w > width * self.min_sensor_width_ratio:
-                # Extract sensor region with small padding
+                # Extract cable region with small padding
                 pad = 5
                 y1 = max(0, y - pad)
                 y2 = min(height, y + h + pad)
                 x1 = max(0, x - pad)
                 x2 = min(width, x + w + pad)
-
-                sensor_img = img[y1:y2, x1:x2]
-                sensors.append(sensor_img)
-                sensor_info.append({
-                    'sensor_idx': idx,
+                
+                cable_img = img[y1:y2, x1:x2]
+                cables.append(cable_img)
+                cable_info.append({
+                    'cable_idx': idx,
                     'bbox': (x, y, w, h),
                     'area': area,
                     'extracted_region': (x1, y1, x2, y2)
                 })
-
-        # Sort sensors by vertical position (top to bottom)
-        sorted_indices = sorted(range(len(sensors)), key=lambda i: sensor_info[i]['bbox'][1])
-        sensors = [sensors[i] for i in sorted_indices]
-        sensor_info = [sensor_info[i] for i in sorted_indices]
-
-        # Renumber sensors from top to bottom
-        for i, info in enumerate(sensor_info):
-            info['sensor_idx'] = i
-
-        return sensors, sensor_info
+        
+        # Sort cables by vertical position (top to bottom)
+        sorted_indices = sorted(range(len(cables)), key=lambda i: cable_info[i]['bbox'][1])
+        cables = [cables[i] for i in sorted_indices]
+        cable_info = [cable_info[i] for i in sorted_indices]
+        
+        # Renumber cables from top to bottom
+        for i, info in enumerate(cable_info):
+            info['cable_idx'] = i
+        
+        return cables, cable_info
     
-    def _preprocess_for_cut_detection(self, img):
-        """Special preprocessing for detecting cuts/lines."""
+    # ====================================
+    # CUT DETECTION
+    # ====================================
+    
+    def preprocess_for_cut_detection(self, img):
+        """Preprocessing for detecting cuts/lines using edge detection."""
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         else:
             gray = img.copy()
-
-        # Apply Gaussian blur to reduce noise
+        
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # Apply Canny edge detection
         edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
-
+        
         return edges
     
-    def _detect_cuts_hough(self, img):
-        """Detect diagonal or vertical cuts using Hough Line Transform."""
-        edges = self._preprocess_for_cut_detection(img)
-
+    def detect_cuts_hough(self, img):
+        """
+        Detect diagonal or vertical cuts using Hough Line Transform.
+        
+        Returns:
+            bool: True if diagonal/vertical cuts detected
+            list: List of detected line angles
+        """
+        edges = self.preprocess_for_cut_detection(img)
+        
         # Detect lines using Hough Transform
         lines = cv2.HoughLinesP(
             edges,
@@ -120,37 +149,41 @@ class CableDefectDetection:
             minLineLength=50,
             maxLineGap=10
         )
-
+        
         if lines is None:
             return False, []
-
+        
         detected_angles = []
         cut_detected = False
-
+        
         for line in lines:
             x1, y1, x2, y2 = line[0]
-
+            
             # Calculate angle from horizontal
             if x2 - x1 == 0:
                 angle = 90
             else:
                 angle = abs(np.degrees(np.arctan((y2 - y1) / (x2 - x1))))
-
+            
             detected_angles.append(angle)
-
-            # Check if line is diagonal or vertical
+            
+            # Check if line is diagonal or vertical (>= min_angle degrees)
             if angle >= self.min_cut_angle:
                 cut_detected = True
-
+        
         return cut_detected, detected_angles
     
-    def _preprocess_sensor(self, img):
-        """Minimal preprocessing - preserve features."""
+    # ====================================
+    # AUTOENCODER PREPROCESSING
+    # ====================================
+    
+    def preprocess_sensor(self, img):
+        """Minimal preprocessing to preserve defects for autoencoder."""
         if len(img.shape) == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return img
     
-    def _resize_sensor(self, img, target_height=128):
+    def resize_sensor(self, img, target_height=128):
         """Resize sensor to standard height while maintaining aspect ratio."""
         h, w = img.shape[:2]
         if h == 0:
@@ -159,126 +192,179 @@ class CableDefectDetection:
         target_width = int(target_height * aspect_ratio)
         return cv2.resize(img, (target_width, target_height), interpolation=cv2.INTER_AREA)
     
-    def _extract_patches(self, img):
-        """Extract overlapping patches from sensor image."""
+    def extract_patches(self, img):
+        """Extract overlapping patches from cable image."""
         patches = []
         h, w = img.shape[:2]
-
+        
         for y in range(0, h - self.patch_size + 1, self.stride):
             for x in range(0, w - self.patch_size + 1, self.stride):
                 patch = img[y:y + self.patch_size, x:x + self.patch_size]
                 if patch.std() > 2:
                     patches.append(patch)
-
+        
         return patches
     
-    def _patches_to_numpy(self, patches):
-        """Convert patches to numpy array."""
+    def patches_to_numpy(self, patches):
+        """Convert patches to numpy array for model input."""
         if len(patches) == 0:
-            return np.array([]).reshape(0, 64, 64, 1)
+            return np.array([]).reshape(0, self.patch_size, self.patch_size, 1)
         arr = np.stack(patches).astype("float32") / 255.0
         arr = arr[..., np.newaxis]
         return arr
     
-    def _compute_sensor_score(self, sensor_img):
+    # ====================================
+    # CABLE CLASSIFICATION
+    # ====================================
+    
+    def classify_cable(self, cable_img):
         """
-        Two-stage classification:
+        Classify a single cable as defective or non-defective.
+        
+        Two-stage detection:
         1. Check for diagonal/vertical cuts
-        2. If no cuts, use autoencoder for other defects
+        2. Use autoencoder for other defects (spots, burns)
         
         Returns:
-            tuple: (score, detection_method, cut_detected)
+            dict: Classification results with score and method
         """
-        # STAGE 1: Cut Detection
-        cut_detected, angles = self._detect_cuts_hough(sensor_img)
-
-        if cut_detected:
-            return 999.0, "cut_detection", True
-
-        # STAGE 2: Autoencoder for other defects
-        if self.model is None:
-            return 0.0, "error", False
+        # Stage 1: Cut detection
+        cut_detected, angles = self.detect_cuts_hough(cable_img)
         
-        preprocessed = self._preprocess_sensor(sensor_img)
-        resized = self._resize_sensor(preprocessed)
-        patches = self._extract_patches(resized)
-
+        if cut_detected:
+            return {
+                'classification': 'Defective',
+                'score': 999.0,
+                'method': 'cut_detection',
+                'cut_detected': True,
+                'angles': angles
+            }
+        
+        # Stage 2: Autoencoder for other defects
+        preprocessed = self.preprocess_sensor(cable_img)
+        resized = self.resize_sensor(preprocessed)
+        patches = self.extract_patches(resized)
+        
         if len(patches) == 0:
-            return 0.0, "autoencoder", False
-
-        X = self._patches_to_numpy(patches)
+            return {
+                'classification': 'Good',
+                'score': 0.0,
+                'method': 'autoencoder',
+                'cut_detected': False,
+                'angles': []
+            }
+        
+        X = self.patches_to_numpy(patches)
         recon = self.model.predict(X, batch_size=128, verbose=0)
         errors = np.mean(np.square(recon - X), axis=(1, 2, 3))
-
-        return np.max(errors), "autoencoder", False
-    
-    def _draw_cable_boxes(self, img, sensor_info, classifications):
-        """Draw bounding boxes with classification results on the image."""
-        vis_img = img.copy()
-        font = cv2.FONT_HERSHEY_SIMPLEX
         
-        for info, classification in zip(sensor_info, classifications):
+        # Use maximum error (focuses on worst patch where defect is)
+        max_error = float(np.max(errors))
+        
+        classification = 'Defective' if max_error > self.threshold else 'Good'
+        
+        return {
+            'classification': classification,
+            'score': max_error,
+            'method': 'autoencoder',
+            'cut_detected': False,
+            'angles': []
+        }
+    
+    # ====================================
+    # VISUALIZATION
+    # ====================================
+    
+    def create_visualization(self, image_path, cables, cable_info, classifications, run_id):
+        """Create visualization showing extracted cables and classifications."""
+        img = cv2.imread(image_path)
+        vis_img = img.copy()
+        
+        # Draw bounding boxes and labels on original image
+        for info, result in zip(cable_info, classifications):
             x, y, w, h = info['bbox']
             
-            # Color based on classification
-            if classification['is_defective']:
-                color = (0, 0, 255)  # Red for defective
-                label = f"Cable {info['sensor_idx']}: DEFECTIVE"
+            # Color code based on classification
+            if result['classification'] == 'Defective':
+                color = (0, 0, 255)  # Red
+                label_color = (0, 0, 255)
             else:
-                color = (0, 255, 0)  # Green for non-defective
-                label = f"Cable {info['sensor_idx']}: OK"
+                color = (0, 255, 0)  # Green
+                label_color = (0, 255, 0)
             
-            # Draw box
-            cv2.rectangle(vis_img, (x, y), (x + w, y + h), color, 3)
+            cv2.rectangle(vis_img, (x, y), (x + w, y + h), color, 2)
             
-            # Draw label background
-            label_size = cv2.getTextSize(label, font, 0.7, 2)[0]
-            cv2.rectangle(vis_img, (x, y - label_size[1] - 10), 
-                         (x + label_size[0], y), color, -1)
+            # Add label with classification
+            label = f"C{info['cable_idx']}: {result['classification']}"
+            if result['method'] == 'cut_detection':
+                label += " (CUT)"
             
-            # Draw label text
-            cv2.putText(vis_img, label, (x, y - 5), font, 0.7, (255, 255, 255), 2)
-            
-            # Draw score
-            score_text = f"Score: {classification['score']:.4f}" if classification['method'] == 'autoencoder' else "Cut detected"
-            cv2.putText(vis_img, score_text, (x, y + h + 20), font, 0.5, color, 1)
+            # Background for text
+            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(vis_img, (x, y - text_h - 8), (x + text_w + 5, y), label_color, -1)
+            cv2.putText(vis_img, label, (x + 2, y - 4), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        return vis_img
+        # Add summary text
+        defective_count = sum(1 for r in classifications if r['classification'] == 'Defective')
+        good_count = len(classifications) - defective_count
+        
+        summary = f"Total Cables: {len(classifications)} | Good: {good_count} | Defective: {defective_count}"
+        cv2.putText(vis_img, summary, (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(vis_img, summary, (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1)
+        
+        # Save visualization
+        vis_filename = f"{run_id}_visualization.jpg"
+        vis_path = os.path.join(self.results_dir, vis_filename)
+        cv2.imwrite(vis_path, vis_img)
+        
+        return vis_filename
+    
+    # ====================================
+    # MAIN PREDICTION METHOD
+    # ====================================
     
     def predict(self, image_path, run_id):
         """
-        Analyze cable defects from an image.
+        Main prediction method that extracts cables and classifies them.
         
         Args:
-            image_path: path to the uploaded image
-            run_id: unique string prefix for output files
-                 
+            image_path: Path to the uploaded sensor image
+            run_id: Unique string prefix for output files
+        
         Returns:
-            dict with output, attributes, visualization_filename, and image_info
+            dict: Results containing classification, attributes, and visualization
         """
-        # Read image
+        # Read image info
         img = cv2.imread(image_path)
         if img is None:
-            raise ValueError(f"Could not read image: {image_path}")
+            return {
+                'output': 'Error: Could not read image',
+                'attributes': {},
+                'visualization_filename': None,
+                'image_info': {
+                    'filename': os.path.basename(image_path),
+                    'width': 0,
+                    'height': 0
+                }
+            }
         
         h, w = img.shape[:2]
         
         # Extract cables from image
-        sensors, sensor_info = self._extract_sensors_from_image(img)
+        cables, cable_info = self.extract_cables_from_image(image_path)
         
-        if len(sensors) == 0:
-            # No cables detected
-            vis_filename = f"{run_id}_no_cables.jpg"
-            cv2.imwrite(os.path.join(self.results_dir, vis_filename), img)
-            
+        if len(cables) == 0:
             return {
-                'output': 'No cables detected',
+                'output': 'No cables detected in image',
                 'attributes': {
-                    'Cables Detected': 0,
-                    'Defective Cables': 0,
-                    'Non-Defective Cables': 0,
+                    'Total Cables': 0,
+                    'Defective': 0,
+                    'Good': 0
                 },
-                'visualization_filename': vis_filename,
+                'visualization_filename': None,
                 'image_info': {
                     'filename': os.path.basename(image_path),
                     'width': w,
@@ -288,70 +374,66 @@ class CableDefectDetection:
         
         # Classify each cable
         classifications = []
-        for sensor_img in sensors:
-            score, method, cut_detected = self._compute_sensor_score(sensor_img)
-            
-            # Determine if defective
-            if method == "cut_detection":
-                is_defective = True
-            else:
-                is_defective = score > self.threshold
-            
-            classifications.append({
-                'score': score,
-                'method': method,
-                'cut_detected': cut_detected,
-                'is_defective': is_defective
-            })
+        for cable in cables:
+            result = self.classify_cable(cable)
+            classifications.append(result)
         
-        # Count defective and non-defective
-        num_defective = sum(1 for c in classifications if c['is_defective'])
-        num_nondefective = len(classifications) - num_defective
+        # Count results
+        defective_count = sum(1 for r in classifications if r['classification'] == 'Defective')
+        good_count = len(classifications) - defective_count
+        
+        # Count detection methods
+        cut_detections = sum(1 for r in classifications if r['method'] == 'cut_detection')
+        ae_detections = sum(1 for r in classifications if r['method'] == 'autoencoder')
+        
+        # Calculate average reconstruction error (excluding cut detections)
+        ae_scores = [r['score'] for r in classifications if r['method'] == 'autoencoder']
+        avg_score = float(np.mean(ae_scores)) if ae_scores else 0.0
+        max_score = float(np.max(ae_scores)) if ae_scores else 0.0
         
         # Create visualization
-        vis_img = self._draw_cable_boxes(img, sensor_info, classifications)
-        vis_filename = f"{run_id}_vis.jpg"
-        cv2.imwrite(os.path.join(self.results_dir, vis_filename), vis_img)
+        vis_filename = self.create_visualization(image_path, cables, cable_info, 
+                                                 classifications, run_id)
         
-        # Determine overall output message
-        if num_defective == 0:
-            output = f"{len(sensors)} cable{'s' if len(sensors) > 1 else ''} detected - All OK"
-        elif num_defective == len(sensors):
-            output = f"{len(sensors)} cable{'s' if len(sensors) > 1 else ''} detected - All DEFECTIVE"
+        # Determine overall output
+        if defective_count > 0:
+            output = f"{defective_count} Defective cable(s) detected"
         else:
-            output = f"{len(sensors)} cables detected - {num_defective} DEFECTIVE, {num_nondefective} OK"
+            output = "All cables are Good"
         
-        # Build attributes dictionary
-        attributes = {
-            'Cables Detected': len(sensors),
-            'Defective Cables': num_defective,
-            'Non-Defective Cables': num_nondefective,
-            'Detection Threshold': self.threshold,
-            'Cut Angle Threshold (°)': self.min_cut_angle,
+        # Save detailed results to JSON
+        results_data = {
+            'total_cables': len(cables),
+            'defective_count': defective_count,
+            'good_count': good_count,
+            'cable_classifications': [
+                {
+                    'cable_idx': info['cable_idx'],
+                    'classification': result['classification'],
+                    'score': result['score'],
+                    'method': result['method'],
+                    'cut_detected': result['cut_detected']
+                }
+                for info, result in zip(cable_info, classifications)
+            ]
         }
         
-        # Add individual cable results
-        for i, (info, classification) in enumerate(zip(sensor_info, classifications)):
-            cable_num = i + 1
-            status = "DEFECTIVE" if classification['is_defective'] else "OK"
-            method = "Cut" if classification['method'] == 'cut_detection' else "Autoencoder"
-            
-            attributes[f'Cable {cable_num} Status'] = status
-            attributes[f'Cable {cable_num} Method'] = method
-            
-            if classification['method'] == 'autoencoder':
-                attributes[f'Cable {cable_num} Score'] = round(classification['score'], 6)
-        
-        # Add detection method breakdown
-        cut_detections = sum(1 for c in classifications if c['method'] == 'cut_detection')
-        ae_detections = sum(1 for c in classifications if c['method'] == 'autoencoder')
-        
-        attributes['Detections by Cut Method'] = cut_detections
-        attributes['Detections by Autoencoder'] = ae_detections
+        results_json = f"{run_id}_results.json"
+        with open(os.path.join(self.results_dir, results_json), 'w') as f:
+            json.dump(results_data, f, indent=2)
         
         return {
             'output': output,
-            'attributes': attributes,
+            'attributes': {
+                'Total Cables': len(cables),
+                'Defective': defective_count,
+                'Good': good_count,
+                'Cut Detections': cut_detections,
+                'Autoencoder Detections': ae_detections,
+                'Avg Reconstruction Error': round(avg_score, 6),
+                'Max Reconstruction Error': round(max_score, 6),
+                'Threshold': self.threshold
+            },
             'visualization_filename': vis_filename,
             'image_info': {
                 'filename': os.path.basename(image_path),
