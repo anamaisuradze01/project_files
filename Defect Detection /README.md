@@ -4,7 +4,7 @@
 
 - **Model Name**: CableDefectDetector
 - **Type**: Detection (Binary Classification: Defective / Non-Defective)
-- **Accuracy**: 92%
+- **Accuracy**: 86%
 - **Technology**: Two-stage detection system
   - Stage 1: Hough Line Transform for cut/crack detection
   - Stage 2: Lightweight Convolutional Autoencoder for anomaly detection
