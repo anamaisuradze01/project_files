@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 from scipy.stats import norm
+from PIL import Image
 
 
 class CableMeasurement:
@@ -11,12 +12,73 @@ class CableMeasurement:
         
         Args:
             results_dir: Directory where output files will be saved
-            **kwargs: Additional configuration parameters (not used in this model)
+            **kwargs: Additional configuration parameters
+                - cut_image: bool, whether to cut image into parts before processing (default: False)
+                - num_columns: int, number of vertical splits (default: 2)
+                - num_rows: int, number of horizontal splits (default: 15)
         """
         self.results_dir = results_dir
+        self.cut_image = kwargs.get('cut_image', False)
+        self.num_columns = kwargs.get('num_columns', 2)
+        self.num_rows = kwargs.get('num_rows', 15)
         
         # Ensure results directory exists
         os.makedirs(self.results_dir, exist_ok=True)
+    
+    def _cut_image_into_parts(self, image_path, run_id):
+        """
+        Cut the input image into parts (columns and rows).
+        Returns list of tuples: (part_image_array, part_name)
+        """
+        parts = []
+        
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            W, H = img.size
+
+            # Calculate column splits
+            if self.num_columns == 2:
+                mid = W // 2
+                cols = [(0, mid), (mid, W)]
+            else:
+                col_width = W // self.num_columns
+                cols = [(i * col_width, (i + 1) * col_width if i < self.num_columns - 1 else W) 
+                        for i in range(self.num_columns)]
+
+            # Calculate row heights
+            base_row_height = H // self.num_rows
+            extra = H % self.num_rows
+
+            row_heights = []
+            for r in range(self.num_rows):
+                h = base_row_height + (1 if r < extra else 0)
+                row_heights.append(h)
+            
+            y_starts = []
+            y = 0
+            for h in row_heights:
+                y_starts.append(y)
+                y += h
+
+            # Crop each part
+            for c_idx, (x0, x1) in enumerate(cols):
+                for r_idx, y0 in enumerate(y_starts):
+                    h = row_heights[r_idx]
+                    left = max(0, min(x0, W))
+                    right = max(0, min(x1, W))
+                    upper = max(0, min(y0, H))
+                    lower = max(0, min(y0 + h, H))
+                    
+                    part = img.crop((left, upper, right, lower))
+                    part_name = f"{run_id}_c{c_idx}_r{r_idx:02d}"
+                    
+                    # Convert PIL image to numpy array (OpenCV format)
+                    part_array = np.array(part)
+                    part_array = cv2.cvtColor(part_array, cv2.COLOR_RGB2BGR)
+                    
+                    parts.append((part_array, part_name))
+        
+        return parts
     
     def _detect_sensor_contours(self, img):
         """Detect cable contours in the image."""
@@ -307,24 +369,8 @@ class CableMeasurement:
 
         return output
 
-    def predict(self, image_path, run_id):
-        """
-        Analyze cable thickness measurements from an image.
-        
-        Args:
-            image_path: path to the uploaded image
-            run_id: unique string prefix for output files
-                 
-        Returns:
-            dict with output, attributes, visualization_filename, and image_info
-        """
-        # Read image
-        img = cv2.imread(image_path)
-        if img is None:
-            raise ValueError(f"Could not read image: {image_path}")
-        
-        h, w = img.shape[:2]
-        
+    def _process_single_image(self, img, part_name=""):
+        """Process a single image (or part) and return measurements."""
         # Detect cables
         cables = self._detect_sensor_contours(img)
         
@@ -340,47 +386,116 @@ class CableMeasurement:
             if thickness is not None:
                 all_combined_thicknesses.extend(thickness['all_thicknesses'])
         
-        # Determine output status
         num_cables = len([t for t in thickness_data if t is not None])
         
         if num_cables == 0:
-            output = "No cables detected"
-            combined_mean = 0
-            combined_std = 0
-            combined_min = 0
-            combined_max = 0
-            combined_cv = 0
-        else:
-            output = f"{num_cables} cable{'s' if num_cables > 1 else ''} detected - Measurements completed"
-            combined_mean = np.mean(all_combined_thicknesses)
-            combined_std = np.std(all_combined_thicknesses)
-            combined_min = np.min(all_combined_thicknesses)
-            combined_max = np.max(all_combined_thicknesses)
-            combined_cv = (combined_std / combined_mean) * 100 if combined_mean > 0 else 0
+            return None, img, num_cables, {}, []
+        
+        # Calculate statistics
+        combined_mean = np.mean(all_combined_thicknesses)
+        combined_std = np.std(all_combined_thicknesses)
+        combined_min = np.min(all_combined_thicknesses)
+        combined_max = np.max(all_combined_thicknesses)
+        combined_cv = (combined_std / combined_mean) * 100 if combined_mean > 0 else 0
+        
+        # Build attributes for this part
+        part_attributes = {
+            'Cables Detected': num_cables,
+            'Combined Mean (px)': round(combined_mean, 2),
+            'Combined Std Dev (px)': round(combined_std, 2),
+            'Combined Min (px)': int(combined_min),
+            'Combined Max (px)': int(combined_max),
+            'Combined CV (%)': round(combined_cv, 2),
+        }
         
         # Create visualization
         vis_img = self._draw_measurements(img, cables, thickness_data)
-        vis_filename = f"{run_id}_vis.jpg"
-        cv2.imwrite(os.path.join(self.results_dir, vis_filename), vis_img)
         
-        # Build attributes dictionary
-        attributes = {
-            'Cables Detected': num_cables,
-            'Combined Mean Thickness (px)': round(combined_mean, 2),
-            'Combined Std Dev (px)': round(combined_std, 2),
-            'Combined Min Thickness (px)': int(combined_min) if combined_min > 0 else 0,
-            'Combined Max Thickness (px)': int(combined_max) if combined_max > 0 else 0,
-            'Combined CV (%)': round(combined_cv, 2),
-            'Total Data Points': len(all_combined_thicknesses)
-        }
+        return vis_img, img, num_cables, part_attributes, thickness_data
+
+    def predict(self, image_path, run_id):
+        """
+        Analyze cable thickness measurements from an image.
+        If cut_image is True, cuts the image into parts first.
         
-        # Add individual cable measurements
-        for i, thickness in enumerate(thickness_data):
-            if thickness is not None:
-                attributes[f'Cable {i+1} Avg (px)'] = round(thickness['avg_thickness'], 2)
-                attributes[f'Cable {i+1} Std Dev (px)'] = round(thickness['std_thickness'], 2)
-                attributes[f'Cable {i+1} Min (px)'] = thickness['min_thickness']
-                attributes[f'Cable {i+1} Max (px)'] = thickness['max_thickness']
+        Args:
+            image_path: path to the uploaded image
+            run_id: unique string prefix for output files
+                 
+        Returns:
+            dict with output, attributes, visualization_filename, and image_info
+        """
+        # Read image
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not read image: {image_path}")
+        
+        h, w = img.shape[:2]
+        
+        if self.cut_image:
+            # Cut image into parts and process each
+            parts = self._cut_image_into_parts(image_path, run_id)
+            
+            all_visualizations = []
+            total_cables = 0
+            all_part_attributes = {}
+            
+            for part_img, part_name in parts:
+                vis_img, orig_img, num_cables, part_attrs, thickness_data = self._process_single_image(part_img, part_name)
+                
+                if vis_img is not None:
+                    # Save visualization for this part
+                    vis_filename = f"{part_name}_vis.jpg"
+                    cv2.imwrite(os.path.join(self.results_dir, vis_filename), vis_img)
+                    all_visualizations.append(vis_filename)
+                    
+                    total_cables += num_cables
+                    
+                    # Add part attributes with part name prefix
+                    for key, value in part_attrs.items():
+                        all_part_attributes[f"{part_name} - {key}"] = value
+            
+            # Create summary output
+            output = f"Image cut into {len(parts)} parts - Total {total_cables} cables detected across all parts"
+            
+            # Main visualization is the first part (or create a summary if needed)
+            vis_filename = all_visualizations[0] if all_visualizations else f"{run_id}_no_cables.jpg"
+            
+            attributes = {
+                'Total Parts': len(parts),
+                'Total Cables Detected': total_cables,
+                **all_part_attributes
+            }
+            
+        else:
+            # Process entire image as before
+            vis_img, orig_img, num_cables, attributes, thickness_data = self._process_single_image(img)
+            
+            if num_cables == 0:
+                output = "No cables detected"
+                vis_filename = f"{run_id}_no_cables.jpg"
+                cv2.imwrite(os.path.join(self.results_dir, vis_filename), img)
+                attributes = {
+                    'Cables Detected': 0,
+                    'Combined Mean Thickness (px)': 0,
+                    'Combined Std Dev (px)': 0,
+                    'Combined Min Thickness (px)': 0,
+                    'Combined Max Thickness (px)': 0,
+                    'Combined CV (%)': 0,
+                    'Total Data Points': 0
+                }
+            else:
+                output = f"{num_cables} cable{'s' if num_cables > 1 else ''} detected - Measurements completed"
+                vis_filename = f"{run_id}_vis.jpg"
+                cv2.imwrite(os.path.join(self.results_dir, vis_filename), vis_img)
+                
+                # Add individual cable measurements to attributes
+                for i, thickness in enumerate(thickness_data):
+                    if thickness is not None:
+                        attributes[f'Cable {i+1} Avg (px)'] = round(thickness['avg_thickness'], 2)
+                        attributes[f'Cable {i+1} Std Dev (px)'] = round(thickness['std_thickness'], 2)
+                        attributes[f'Cable {i+1} Min (px)'] = thickness['min_thickness']
+                        attributes[f'Cable {i+1} Max (px)'] = thickness['max_thickness']
         
         return {
             'output': output,
